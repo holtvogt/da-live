@@ -86,8 +86,7 @@ class Editor extends LitElement {
   }
 
   disconnectedCallback() {
-    this._inputTimers.forEach((id) => clearTimeout(id));
-    this._inputTimers.clear();
+    this.applyPendingInput();
     document.removeEventListener('click', this._onDocClick);
     document.removeEventListener('keydown', this._onDocKeydown);
     super.disconnectedCallback();
@@ -143,15 +142,24 @@ class Editor extends LitElement {
 
   _mutateDebounced(pointer, fn) {
     this._cancelDebounced(pointer);
-    this._inputTimers.set(pointer, setTimeout(() => {
+    const apply = () => {
       this._inputTimers.delete(pointer);
       this._mutate(fn);
-    }, DEBOUNCE_MS));
+    };
+    this._inputTimers.set(pointer, { id: setTimeout(apply, DEBOUNCE_MS), apply });
   }
 
   _cancelDebounced(pointer) {
-    clearTimeout(this._inputTimers.get(pointer));
+    clearTimeout(this._inputTimers.get(pointer)?.id);
     this._inputTimers.delete(pointer);
+  }
+
+  // Applies input still waiting in the debounce now, so a save or teardown keeps it.
+  applyPendingInput() {
+    [...this._inputTimers.values()].forEach(({ id, apply }) => {
+      clearTimeout(id);
+      apply();
+    });
   }
 
   _error(pointer) {

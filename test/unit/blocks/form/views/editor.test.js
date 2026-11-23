@@ -72,6 +72,33 @@ describe('ew-form-fields primitive controls', () => {
     expect(calls).to.deep.equal([['/data/body', '<p>bye</p>']]);
   });
 
+  it('applies input still waiting in the debounce on demand', async () => {
+    const formEditor = await mountEditor(objectRoot([richTextNode()]));
+    const calls = [];
+    formEditor.editor = { setField: (pointer, value) => calls.push([pointer, value]) };
+    const field = formEditor.shadowRoot.querySelector('ew-form-rich-text');
+    field.value = '<p>bye</p>';
+    field.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+
+    formEditor.applyPendingInput();
+
+    expect(calls).to.deep.equal([['/data/body', '<p>bye</p>']]);
+    expect(formEditor._inputTimers.size).to.equal(0);
+  });
+
+  it('applies input still waiting in the debounce when removed', async () => {
+    const formEditor = await mountEditor(objectRoot([richTextNode()]));
+    const calls = [];
+    formEditor.editor = { setField: (pointer, value) => calls.push([pointer, value]) };
+    const field = formEditor.shadowRoot.querySelector('ew-form-rich-text');
+    field.value = '<p>bye</p>';
+    field.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+
+    formEditor.remove();
+
+    expect(calls).to.deep.equal([['/data/body', '<p>bye</p>']]);
+  });
+
   it('clears an emptied rich-text value on change', async () => {
     const formEditor = await mountEditor(objectRoot([richTextNode()]));
     const calls = [];

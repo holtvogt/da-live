@@ -23,6 +23,11 @@ const demoSchema = {
 
 const validDoc = (data = {}) => ({ metadata: { schemaName: 'demo' }, data });
 
+const toastShown = () => new Promise((resolve) => {
+  const check = () => (window.daTestToasts.length ? resolve() : setTimeout(check));
+  check();
+});
+
 // Track mounted elements so we can remove them after each test — leftover
 // <ew-form-editor>s carry live engines and re-rendering previews that would otherwise
 // slow down (and flake) later test files in the shared wtr page.
@@ -200,5 +205,74 @@ describe('ew-form-editor', () => {
     await el.updateComplete;
     const { tags } = el._editor.getState().document.data;
     expect(tags === undefined || tags.length === 0).to.equal(true);
+  });
+
+  describe('forceSave()', () => {
+    it('resolves ok when no document is loaded', async () => {
+      const form = makeForm();
+      expect(await form.forceSave()).to.deep.equal({ ok: true });
+    });
+
+    it('applies field input still waiting in the debounce before flushing', async () => {
+      const form = await mountReady();
+      const fields = form.shadowRoot.querySelector('ew-form-fields');
+      fields._mutateDebounced('/data/name', (editor) => editor.setField('/data/name', 'Grace'));
+      let nameAtFlush;
+      form._persistence = {
+        flush: async () => {
+          nameAtFlush = form._editor.getState().document.data.name;
+          return { ok: true };
+        },
+        detach() {},
+      };
+
+      expect(await form.forceSave()).to.deep.equal({ ok: true });
+      expect(nameAtFlush).to.equal('Grace');
+      expect(fields._inputTimers.size).to.equal(0);
+    });
+
+    it('resolves with the result of the persistence flush', async () => {
+      const form = makeForm();
+      const failure = { ok: false, error: 'Forbidden', status: 403 };
+      form._persistence = { flush: async () => failure, detach() {} };
+      expect(await form.forceSave()).to.deep.equal(failure);
+    });
+
+    it('shows an error toast when a save fails', async () => {
+      sinon.stub(window, 'fetch').resolves(new Response('', { status: 403 }));
+      window.daTestToasts = [];
+      const form = makeForm();
+      form._details = { fullpath: '/adobe/demo/page.html' };
+      form._start({ schema: demoSchema, json: validDoc({ name: 'Ada' }) });
+      form._editor.setField('/data/name', 'Grace');
+
+      const result = await form.forceSave();
+      expect(result).to.include({ ok: false, status: 403 });
+      await toastShown();
+      expect(window.daTestToasts[0]).to.deep.equal({
+        text: 'You don\'t have permission to save this document.',
+        variant: 'error',
+      });
+    });
+  });
+
+  it('saves field input still waiting in the debounce when removed', async () => {
+    const form = await mountReady();
+    const notify = sinon.spy();
+    form._persistence = { notify, detach() {} };
+    form._editor = createEngine({
+      schema: demoSchema,
+      document: validDoc({ name: 'Ada' }),
+      onChange: form._onChange,
+    });
+    form._state = form._editor.getState();
+    await form.updateComplete;
+    const fields = form.shadowRoot.querySelector('ew-form-fields');
+    fields._mutateDebounced('/data/name', (editor) => editor.setField('/data/name', 'Grace'));
+
+    form.remove();
+
+    expect(form._editor.getState().document.data.name).to.equal('Grace');
+    expect(notify.called).to.equal(true);
   });
 });

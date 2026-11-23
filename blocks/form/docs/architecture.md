@@ -38,7 +38,7 @@ blocks/form/
     context.js            loadFormContext — routes documents to ready / blocked / select-schema
     da-api.js             fetch/save against DA source via the nx2 source api
     schemas.js            loadSchemas — schema discovery + module cache
-    persistence.js        attachPersistence — single-flight save with re-queue
+    persistence.js        attachPersistence — single-flight save with re-queue, flush()
     safe-href.js          safeHref — drops links that run script or local programs
     rich-text/            rich-text schema with its HTML conversion, commands and toolset
   views/
@@ -148,17 +148,18 @@ Lives in [views/editor.js](../views/editor.js), keyed per pointer, default 350ms
 
 ```js
 _mutateDebounced(pointer, fn) {
-  clearTimeout(this._inputTimers.get(pointer));
-  this._inputTimers.set(pointer, setTimeout(() => {
+  this._cancelDebounced(pointer);
+  const apply = () => {
     this._inputTimers.delete(pointer);
     this._mutate(fn);   // → fn(this.editor); state notification flows through editor.onChange
-  }, DEBOUNCE_MS));
+  };
+  this._inputTimers.set(pointer, { id: setTimeout(apply, DEBOUNCE_MS), apply });
 }
 ```
 
 Debouncing lives in the UI component, not the SDK. The SDK's mutations are synchronous and assume the caller has already decided when to apply them.
 
-Note: a navigation away within the debounce window currently drops the last keystroke. Address with a `beforeunload` flush if it becomes a problem.
+`applyPendingInput()` runs every waiting mutation at once. The shell calls it before it detaches persistence (on disconnect and when it loads another document) and in `forceSave()`, and the fields call it when they disconnect. Leaving the form within the debounce window therefore keeps the last input. A full page unload still drops it.
 
 ---
 
@@ -190,13 +191,26 @@ import { attachPersistence } from './utils/persistence.js';
 // itself — no flag, no observing toggle.
 this._editor = createEngine({ schema, document: json, onChange: this._onChange });
 this._state = this._editor.getState();
-this._persistence = attachPersistence(this._editor, { path: this._details?.fullpath });
+this._persistence = attachPersistence(this._editor, {
+  path: this._details?.fullpath,
+  onError: showSaveError,
+});
 
-// On teardown (`_loadContext` reset, hashchange to a different doc):
+// On teardown (`_loadContext` reset, hashchange to a different doc), after
+// applying the input still waiting in the debounce:
 this._persistence?.detach();
 ```
 
-`persistence.js` is ~50 lines, self-contained: it imports `convertJsonToHtml` from the SDK and accepts a `save` function (default `saveSourceHtml` from `./da-api.js`). The form block's call site is one line — no callback factory needed. If a save-indicator UI is ever added, the persistence would gain a status callback at that time.
+`persistence.js` is self-contained: it imports `convertJsonToHtml` from the SDK and accepts a `save` function (default `saveSourceHtml` from `./da-api.js`).
+
+### Save results
+
+A save only counts when `save()` resolves `{ ok: true }`. A resolved `{ error, status }`, a signed-out `{}`, a conversion error and a thrown error are failures. There is no automatic retry in the background.
+
+- Every edit bumps a revision. A successful save marks the revision it sent as saved. A failed save marks nothing, and the next save covers it because every save sends the full document.
+- `flush()` waits for the running save and its coalesced follow-up. With no save running it sends unsaved edits again, except after `detach()`. It resolves `{ ok: true }` when the document as of the call is saved, otherwise `{ ok: false, error, status }`.
+- `onError(failure)` fires once per run of failures and again only after a save succeeded. The shell shows an error toast for it, with a permission message for 401 and 403.
+- `ew-form-editor.forceSave()` applies pending input, then returns `flush()`, or `{ ok: true }` when no document is loaded. It has the same contract as the canvas `ew-editor-doc.forceSave()`, so Preview and Publish in `ew-actions` can confirm the document reached the source before they read it.
 
 For test details on the single-flight + re-queue contract, see [test/unit/blocks/form/utils/persistence.test.js](../../../test/unit/blocks/form/utils/persistence.test.js).
 

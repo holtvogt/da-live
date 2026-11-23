@@ -45,6 +45,18 @@ function ctxFromHashState(state) {
   return { org: state.org, repo: state.site, path: state.fullpath.slice(1) };
 }
 
+const FORBIDDEN_STATUSES = [401, 403];
+
+async function showSaveError({ status }) {
+  const { showToast, VARIANT_ERROR } = await import(`${getNx2()}/blocks/shared/toast/toast.js`);
+  showToast({
+    text: FORBIDDEN_STATUSES.includes(status)
+      ? 'You don\'t have permission to save this document.'
+      : 'Your changes could not be saved.',
+    variant: VARIANT_ERROR,
+  });
+}
+
 class Form extends LitElement {
   static properties = {
     ctx: { attribute: false },
@@ -101,6 +113,8 @@ class Form extends LitElement {
     this._unsubscribe = null;
     this._unsubscribeJump?.();
     this._unsubscribeJump = null;
+    // Runs before the fields disconnect, while persistence still saves the input.
+    this._applyPendingInput();
     this._persistence?.detach();
     this._persistence = null;
     formEvents.formState.emit(null);
@@ -130,6 +144,17 @@ class Form extends LitElement {
     }
   }
 
+  // Mirrors the canvas `ew-editor-doc.forceSave()`: callers such as Preview and
+  // Publish await it before reading the document from the source.
+  forceSave() {
+    this._applyPendingInput();
+    return this._persistence?.flush() ?? Promise.resolve({ ok: true });
+  }
+
+  _applyPendingInput() {
+    this.shadowRoot?.querySelector('ew-form-fields')?.applyPendingInput();
+  }
+
   _start({ schema, json }) {
     this._editor = createEngine({ schema, document: json, onChange: this._onChange });
     // Seed empty rows for required arrays (UI convenience). Runs before
@@ -139,7 +164,10 @@ class Form extends LitElement {
     this._state = this._editor.getState();
     // Attach AFTER load so the loaded document is the persistence's baseline —
     // mutations after this point trigger saves; the load itself does not.
-    this._persistence = attachPersistence(this._editor, { path: this._details?.fullpath });
+    this._persistence = attachPersistence(this._editor, {
+      path: this._details?.fullpath,
+      onError: showSaveError,
+    });
     this._nav = { pointer: '/data', origin: null, seq: 0 };
   }
 
@@ -159,6 +187,8 @@ class Form extends LitElement {
   }
 
   async _loadContext() {
+    // The input belongs to the document being left, so save it before switching.
+    this._applyPendingInput();
     this._loadVersion += 1;
     const version = this._loadVersion;
     this._pendingSchemaId = '';

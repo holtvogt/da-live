@@ -26,8 +26,9 @@ function makeEditor(initial = {}) {
   };
 }
 
-// A controllable save stub. Returns a Promise that resolves only when the
-// test calls `release(callIndex)`. Tracks every (path, html) call.
+// A controllable save stub. Returns a Promise that settles only when the test
+// calls `release(callIndex, result)` or `fail(callIndex)`. Tracks every
+// (path, html) call.
 function makeSave() {
   const calls = [];
   const resolvers = [];
@@ -38,7 +39,7 @@ function makeSave() {
   return {
     save,
     calls,
-    release: (i = calls.length - 1) => resolvers[i].resolve(),
+    release: (i = calls.length - 1, result = { ok: true }) => resolvers[i].resolve(result),
     fail: (i = calls.length - 1, err = new Error('boom')) => resolvers[i].reject(err),
     settledCount: () => resolvers.length,
   };
@@ -145,7 +146,7 @@ describe('attachPersistence', () => {
     expect(calls).to.have.lengthOf(1);
   });
 
-  it('does not crash when save throws — and stops the loop instead of retrying forever', async () => {
+  it('does not retry on its own when save throws; the next mutation saves again', async () => {
     const editor = makeEditor();
     const { save, calls, fail } = makeSave();
     const p = attachPersistence(editor, { path: '/x', save });
@@ -157,8 +158,6 @@ describe('attachPersistence', () => {
 
     fail(0);
     await tick();
-    // No retry — persistence intentionally swallows the error. Caller's next
-    // mutation triggers a fresh save attempt.
     expect(calls).to.have.lengthOf(1);
 
     editor.setValues({ a: 2 });
@@ -214,5 +213,150 @@ describe('attachPersistence', () => {
     expect(calls[0].html).to.include('<p>Hello <strong>bold</strong></p>');
     release();
     p.detach();
+  });
+
+  describe('flush()', () => {
+    it('resolves ok without saving when nothing changed', async () => {
+      const { save, calls } = makeSave();
+      const p = attachPersistence(makeEditor(), { path: '/x', save });
+      expect(await p.flush()).to.deep.equal({ ok: true });
+      expect(calls).to.have.lengthOf(0);
+    });
+
+    it('waits for the in-flight save and its coalesced follow-up', async () => {
+      const editor = makeEditor();
+      const { save, calls, release } = makeSave();
+      const p = attachPersistence(editor, { path: '/x', save });
+
+      editor.setValues({ a: 1 });
+      p.notify();
+      editor.setValues({ a: 2 });
+      p.notify();
+      let result;
+      p.flush().then((r) => { result = r; });
+
+      release(0);
+      await tick();
+      expect(result).to.equal(undefined);
+      expect(calls).to.have.lengthOf(2);
+      release(1);
+      await tick();
+      expect(result).to.deep.equal({ ok: true });
+    });
+
+    it('reports the error and status a failed save resolves', async () => {
+      const editor = makeEditor();
+      const { save, release } = makeSave();
+      const p = attachPersistence(editor, { path: '/x', save });
+
+      editor.setValues({ a: 1 });
+      p.notify();
+      const flushed = p.flush();
+      release(0, { error: 'Could not save source document.', status: 500 });
+      const failure = { ok: false, error: 'Could not save source document.', status: 500 };
+      expect(await flushed).to.deep.equal(failure);
+    });
+
+    it('reports a save that resolves without ok, such as a signed-out {}', async () => {
+      const editor = makeEditor();
+      const { save, release } = makeSave();
+      const p = attachPersistence(editor, { path: '/x', save });
+
+      editor.setValues({ a: 1 });
+      p.notify();
+      const flushed = p.flush();
+      release(0, {});
+      expect(await flushed).to.deep.equal({ ok: false, error: 'Could not save source document.' });
+    });
+
+    it('reports a thrown save error', async () => {
+      const editor = makeEditor();
+      const { save, fail } = makeSave();
+      const p = attachPersistence(editor, { path: '/x', save });
+
+      editor.setValues({ a: 1 });
+      p.notify();
+      const flushed = p.flush();
+      fail(0, new Error('offline'));
+      expect(await flushed).to.deep.equal({ ok: false, error: 'offline' });
+    });
+
+    it('reports a conversion error without saving', async () => {
+      const editor = makeEditor();
+      const { save, calls } = makeSave();
+      const p = attachPersistence(editor, { path: '/x', save });
+
+      editor.setValues({ a: 1 });
+      editor.getState().document.metadata = {};
+      p.notify();
+      const result = await p.flush();
+      expect(result.ok).to.equal(false);
+      expect(result.error).to.match(/^Could not convert document to HTML/);
+      expect(calls).to.have.lengthOf(0);
+    });
+
+    it('sends unsaved edits again after a failed save', async () => {
+      const editor = makeEditor();
+      const { save, calls, release } = makeSave();
+      const p = attachPersistence(editor, { path: '/x', save });
+
+      editor.setValues({ a: 1 });
+      p.notify();
+      release(0, { error: 'Could not save source document.', status: 503 });
+      await tick();
+
+      const flushed = p.flush();
+      await tick();
+      expect(calls).to.have.lengthOf(2);
+      expect(calls[1].html).to.include('>1<');
+      release(1);
+      expect(await flushed).to.deep.equal({ ok: true });
+    });
+
+    it('does not start a save after detach()', async () => {
+      const editor = makeEditor();
+      const { save, calls, release } = makeSave();
+      const p = attachPersistence(editor, { path: '/x', save });
+
+      editor.setValues({ a: 1 });
+      p.notify();
+      release(0, { error: 'Could not save source document.' });
+      await tick();
+      p.detach();
+
+      expect((await p.flush()).ok).to.equal(false);
+      expect(calls).to.have.lengthOf(1);
+    });
+  });
+
+  describe('onError', () => {
+    it('reports once per run of failures and again after a successful save', async () => {
+      const editor = makeEditor();
+      const { save, release } = makeSave();
+      const errors = [];
+      const p = attachPersistence(editor, { path: '/x', save, onError: (e) => errors.push(e) });
+      const failure = { error: 'Could not save source document.', status: 500 };
+
+      editor.setValues({ a: 1 });
+      p.notify();
+      release(0, failure);
+      await tick();
+      editor.setValues({ a: 2 });
+      p.notify();
+      release(1, failure);
+      await tick();
+      expect(errors).to.deep.equal([{ ok: false, ...failure }]);
+
+      editor.setValues({ a: 3 });
+      p.notify();
+      release(2);
+      await tick();
+      editor.setValues({ a: 4 });
+      p.notify();
+      release(3, failure);
+      await tick();
+      expect(errors).to.have.lengthOf(2);
+      p.detach();
+    });
   });
 });
